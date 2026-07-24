@@ -10,19 +10,28 @@ import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.server.IntegratedServer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.material.Fluids;
 
 import org.lwjgl.glfw.GLFW;
 
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 public class RandomTeleportClient implements ClientModInitializer {
-	// Farthest a single teleport can move you horizontally, in blocks.
-	private static final int MAX_RANGE = 2000;
+
+	/** The four places a teleport can send you. One is picked at random per key press. */
+	private enum Destination { ABOVE_GROUND, WATER, NETHER, END }
+
+	/** A resolved teleport target: which world, which block, and a label for the message. */
+	private record Target(ServerLevel level, BlockPos pos, String label) {}
 
 	private static KeyMapping teleportKey;
 
@@ -56,26 +65,127 @@ public class RandomTeleportClient implements ClientModInitializer {
 			return;
 		}
 
-		// The actual move must run on the server thread so the client stays in sync.
 		UUID uuid = player.getUUID();
+		Destination[] all = Destination.values();
+		Destination destination = all[ThreadLocalRandom.current().nextInt(all.length)];
+
+		// The move (and all world queries) must run on the server thread.
 		server.execute(() -> {
-			ServerPlayer serverPlayer = server.getPlayerList().getPlayer(uuid);
-			if (serverPlayer == null) {
+			ServerPlayer sp = server.getPlayerList().getPlayer(uuid);
+			if (sp == null) {
 				return;
 			}
-			ServerLevel level = serverPlayer.level();
+			int cx = (int) Math.floor(sp.getX());
+			int cz = (int) Math.floor(sp.getZ());
 			ThreadLocalRandom rng = ThreadLocalRandom.current();
 
-			int x = (int) Math.floor(serverPlayer.getX()) + rng.nextInt(-MAX_RANGE, MAX_RANGE + 1);
-			int z = (int) Math.floor(serverPlayer.getZ()) + rng.nextInt(-MAX_RANGE, MAX_RANGE + 1);
-			// Drop onto the highest solid/liquid block in that column so you never land in the void or inside terrain.
-			int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) + 1;
+			Target target = switch (destination) {
+				case ABOVE_GROUND -> findAboveGround(server, cx, cz, rng);
+				case WATER -> findWater(server, cx, cz, rng);
+				case NETHER -> findNether(server, cx, cz, rng);
+				case END -> findEnd(server, rng);
+			};
 
-			// +0.5 centers the player on the block.
-			serverPlayer.teleportTo(x + 0.5, y, z + 0.5);
-			serverPlayer.sendSystemMessage(
-				Component.literal("Teleported to " + x + ", " + y + ", " + z), true);
-			RandomTeleportMod.LOGGER.info("Random teleport -> {} {} {}", x, y, z);
+			// If the chosen destination couldn't be found, fall back to dry land in the overworld.
+			if (target == null) {
+				Target fallback = findAboveGround(server, cx, cz, rng);
+				if (fallback == null) {
+					sp.sendSystemMessage(Component.literal("[Random Teleport] Couldn't find a safe spot."), true);
+					return;
+				}
+				target = new Target(fallback.level(), fallback.pos(), fallback.label() + " (fallback)");
+			}
+
+			BlockPos p = target.pos();
+			boolean ok = sp.teleportTo(
+				target.level(), p.getX() + 0.5, p.getY(), p.getZ() + 0.5,
+				Set.of(), sp.getYRot(), sp.getXRot(), true);
+
+			if (ok) {
+				sp.sendSystemMessage(Component.literal(
+					"Teleported " + target.label() + " → " + p.getX() + ", " + p.getY() + ", " + p.getZ()), true);
+				RandomTeleportMod.LOGGER.info("Random teleport {} -> {} {} {}",
+					target.label(), p.getX(), p.getY(), p.getZ());
+			}
 		});
+	}
+
+	// ---- destination finders (all run on the server thread) --------------------------------
+
+	/** Random dry-land spot on the overworld surface (skips oceans/rivers). */
+	private static Target findAboveGround(IntegratedServer server, int cx, int cz, ThreadLocalRandom rng) {
+		ServerLevel level = server.overworld();
+		for (int i = 0; i < 24; i++) {
+			int x = cx + rng.nextInt(-3000, 3001);
+			int z = cz + rng.nextInt(-3000, 3001);
+			int surface = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+			BlockState ground = level.getBlockState(new BlockPos(x, surface - 1, z));
+			if (ground.blocksMotion() && ground.getFluidState().isEmpty()) {
+				return new Target(level, new BlockPos(x, surface, z), "above ground");
+			}
+		}
+		return null;
+	}
+
+	/** Random spot floating at the surface of an ocean/lake in the overworld. */
+	private static Target findWater(IntegratedServer server, int cx, int cz, ThreadLocalRandom rng) {
+		ServerLevel level = server.overworld();
+		for (int i = 0; i < 32; i++) {
+			int x = cx + rng.nextInt(-4000, 4001);
+			int z = cz + rng.nextInt(-4000, 4001);
+			int top = level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
+			BlockState surfaceBlock = level.getBlockState(new BlockPos(x, top - 1, z));
+			if (surfaceBlock.getFluidState().isSourceOfType(Fluids.WATER)) {
+				return new Target(level, new BlockPos(x, top - 1, z), "into water");
+			}
+		}
+		return null;
+	}
+
+	/** Random air pocket in the Nether with solid, non-lava ground below and headroom above. */
+	private static Target findNether(IntegratedServer server, int cx, int cz, ThreadLocalRandom rng) {
+		ServerLevel level = server.getLevel(Level.NETHER);
+		if (level == null) {
+			return null;
+		}
+		for (int i = 0; i < 20; i++) {
+			int x = cx + rng.nextInt(-800, 801);
+			int z = cz + rng.nextInt(-800, 801);
+			// Scan down from just below the bedrock roof for the first standable ledge.
+			for (int y = 118; y >= level.getMinY() + 2; y--) {
+				BlockState ground = level.getBlockState(new BlockPos(x, y, z));
+				BlockState feet = level.getBlockState(new BlockPos(x, y + 1, z));
+				BlockState head = level.getBlockState(new BlockPos(x, y + 2, z));
+				if (ground.blocksMotion() && ground.getFluidState().isEmpty()
+					&& feet.isAir() && head.isAir()) {
+					return new Target(level, new BlockPos(x, y + 1, z), "to the Nether");
+				}
+			}
+		}
+		return null;
+	}
+
+	/** Random spot on the End's main island (stays near 0,0 so you don't drop into the void). */
+	private static Target findEnd(IntegratedServer server, ThreadLocalRandom rng) {
+		ServerLevel level = server.getLevel(Level.END);
+		if (level == null) {
+			return null;
+		}
+		for (int i = 0; i < 24; i++) {
+			int x = rng.nextInt(-128, 129);
+			int z = rng.nextInt(-128, 129);
+			// Avoid landing on the central exit portal.
+			if (Math.abs(x) < 8 && Math.abs(z) < 8) {
+				continue;
+			}
+			int surface = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+			if (surface > level.getMinY()) {
+				BlockState ground = level.getBlockState(new BlockPos(x, surface - 1, z));
+				if (ground.blocksMotion() && ground.getFluidState().isEmpty()) {
+					return new Target(level, new BlockPos(x, surface, z), "to the End");
+				}
+			}
+		}
+		return null;
 	}
 }
