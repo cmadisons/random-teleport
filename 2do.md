@@ -1,0 +1,1 @@
+in the same mod make sheep have different colours wool and look different colours
