@@ -12,6 +12,7 @@ public class RandomTeleportMod implements ModInitializer {
 
 	@Override
 	public void onInitialize() {
-		LOGGER.info("Random Teleport loaded — press G in-game to teleport to a random location.");
+		Sheep.register();
+		LOGGER.info("Random Teleport loaded — press G to teleport, and the sheep come in all sixteen colours.");
 	}
 }
